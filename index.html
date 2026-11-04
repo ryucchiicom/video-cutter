@@ -892,94 +892,13 @@ function updatePreviewPickState() {
     : 'プレビュー。動画をドラッグ＆ドロップすると差し替え');
 }
 
-function readSelectedFileImmediately(file, fileHandle = null) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => {
-      if (reader.result instanceof ArrayBuffer) resolve(new Uint8Array(reader.result));
-      else reject(new Error('動画ファイルの読み込み結果を取得できなかったよ。'));
-    };
-    reader.onerror = async () => {
-      const firstError = reader.error || new Error('FileReaderで動画ファイルを読み込めなかったよ。');
-      let secondError = null;
-      try {
-        // FileReaderとは別のBlob読み込み経路でも試す。
-        const buffer = await file.arrayBuffer();
-        resolve(new Uint8Array(buffer));
-        return;
-      } catch (error) {
-        secondError = error;
-      }
-      if (fileHandle && typeof fileHandle.getFile === 'function') {
-        try {
-          // File System Access APIでファイル情報を取り直し、新しいスナップショットから再試行する。
-          const refreshedFile = await fileHandle.getFile();
-          const refreshedBuffer = await refreshedFile.arrayBuffer();
-          resolve(new Uint8Array(refreshedBuffer));
-          return;
-        } catch (refreshError) {
-          reject(new Error(
-            `動画ファイルを読み込めなかったよ。\nFileReader: ${firstError.message || String(firstError)}\narrayBuffer: ${secondError && secondError.message ? secondError.message : String(secondError)}\nファイル再取得: ${refreshError && refreshError.message ? refreshError.message : String(refreshError)}\nWindows側でファイルがロックされている、選択後に移動・変更された、またはクラウド同期中の可能性があるよ。別のローカル動画でも同じか確認してね。`
-          ));
-        }
-      }
-      reject(new Error(
-        `動画ファイルを読み込めなかったよ。\nFileReader: ${firstError.message || String(firstError)}\narrayBuffer: ${secondError && secondError.message ? secondError.message : String(secondError)}\nWindows側でファイルがロックされている、選択後に移動・変更された、またはクラウド同期中の可能性があるよ。別のローカル動画でも同じか確認してね。`
-      ));
-    };
-    reader.onabort = () => reject(new Error('動画ファイルの読み込みが中断されたよ。'));
-    try {
-      // ファイル選択イベントの直後に読み込みを開始する。FFmpegの通信待ちより先に参照を確保する。
-      reader.readAsArrayBuffer(file);
-    } catch (error) {
-      reject(error);
-    }
-  });
-}
-
-async function selectVideoFile() {
-  if (typeof window.showOpenFilePicker === 'function') {
-    try {
-      const [handle] = await window.showOpenFilePicker({
-        multiple: false,
-        types: [{
-          description: '動画ファイル',
-          accept: {
-            'video/mp4': ['.mp4', '.m4v'],
-            'video/quicktime': ['.mov'],
-            'video/webm': ['.webm'],
-            'video/x-matroska': ['.mkv'],
-            'video/x-msvideo': ['.avi'],
-            'video/x-ms-wmv': ['.wmv'],
-            'video/mpeg': ['.mpeg', '.mpg'],
-            'video/mp2t': ['.ts', '.mts', '.m2ts'],
-            'video/3gpp': ['.3gp'],
-            'video/ogg': ['.ogv']
-          }
-        }]
-      });
-      if (!handle) return;
-      const file = await handle.getFile();
-      await loadSelectedFile(file, handle);
-      return;
-    } catch (error) {
-      if (error && error.name === 'AbortError') return;
-      console.warn('システムファイル選択で開けなかったため、通常のファイル選択に切り替えるよ:', error);
-    }
-  }
-  els.fileInput.click();
-}
-
-async function loadSelectedFile(file, fileHandle = null) {
+async function loadSelectedFile(file) {
   if (!file) return;
   const previousInputName = currentInputName;
   if (busy) {
     alert('今の処理が終わってから、別のファイルを選んでね。');
     return;
   }
-  // Chrome / Edgeでは、選択から時間が経ってからFileを読むとNotReadableErrorになる場合があるため、
-  // ファイル選択イベント内で先に読み込みを開始しておく。
-  const fileBytesPromise = readSelectedFileImmediately(file, fileHandle);
   currentFile = file;
   updatePreviewPickState();
   currentExt = extFromName(file.name);
@@ -1003,28 +922,60 @@ async function loadSelectedFile(file, fileHandle = null) {
   els.image.hidden = true;
   els.cutButton.disabled = true;
   if (currentObjectURL) URL.revokeObjectURL(currentObjectURL);
-  currentObjectURL = URL.createObjectURL(file);
+  currentObjectURL = null;
   els.video.removeAttribute('src');
   els.video.load();
-  els.video.src = currentObjectURL;
-  els.video.load();
-  if (Number.isFinite(els.video.duration)) sourceDuration = els.video.duration;
   updateSummary();
-  await prepareWithFFmpeg(file, previousInputName, fileBytesPromise);
+  await prepareWithFFmpeg(file, previousInputName);
 }
-async function prepareWithFFmpeg(file, previousInputName = '', fileBytesPromise = null) {
+async function readSelectedFileBytes(file) {
+  let arrayBufferError = null;
+  try {
+    const buffer = await file.arrayBuffer();
+    if (buffer.byteLength !== file.size) throw new Error(`ファイルサイズが一致しないよ（${buffer.byteLength} / ${file.size} bytes）。`);
+    return new Uint8Array(buffer);
+  } catch (error) {
+    arrayBufferError = error;
+  }
+  try {
+    const buffer = await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result);
+      reader.onerror = () => reject(reader.error || new Error('FileReaderで読み取れなかったよ。'));
+      reader.onabort = () => reject(new Error('ファイルの読み込みが中断されたよ。'));
+      reader.readAsArrayBuffer(file);
+    });
+    if (!(buffer instanceof ArrayBuffer) || buffer.byteLength !== file.size) {
+      throw new Error(`ファイルサイズが一致しないよ（${buffer && buffer.byteLength} / ${file.size} bytes）。`);
+    }
+    return new Uint8Array(buffer);
+  } catch (readerError) {
+    const firstMessage = arrayBufferError && arrayBufferError.message ? arrayBufferError.message : String(arrayBufferError);
+    const secondMessage = readerError && readerError.message ? readerError.message : String(readerError);
+    const error = new Error(`元の動画ファイルを読み取れなかったよ。選択後にファイルが移動・変更されたか、Windows側のクラウド同期／ネットワークドライブなどが一時的に読み取りを拒否した可能性があるよ。PC内の通常のフォルダーへ動画をコピーしてから、もう一度選んでみてね。
+arrayBuffer: ${firstMessage}
+FileReader: ${secondMessage}`);
+    error.name = (arrayBufferError && arrayBufferError.name) || (readerError && readerError.name) || 'NotReadableError';
+    throw error;
+  }
+}
+async function prepareWithFFmpeg(file, previousInputName = '') {
   busy = true;
   operation = 'prepare';
   els.cutButton.disabled = true;
   try {
-    setProgress(2, '動画ファイルを先に読み込み中…', `${humanSize(file.size)} を選択直後に読み込んでいるよ。`, true);
-    let bytes = await (fileBytesPromise || readSelectedFileImmediately(file));
+    setProgress(3, '元動画を先に読み込み中…', `${humanSize(file.size)} をPCのブラウザから読み込んでいるよ。`);
+    const bytes = await readSelectedFileBytes(file);
+    if (currentFile === file) {
+      currentObjectURL = URL.createObjectURL(file);
+      els.video.src = currentObjectURL;
+      els.video.load();
+    }
     await ensureEngine();
-    setProgress(56, 'ファイルをメモリに読み込み中…', `${humanSize(file.size)} をブラウザ内に読み込んでいるよ。`);
+    setProgress(56, 'FFmpegへ動画を渡し中…', `${humanSize(file.size)} をブラウザ内の処理領域へコピーしているよ。`);
     if (previousInputName && previousInputName !== currentInputName) { try { await ffmpeg.deleteFile(previousInputName); } catch (_) {} }
     try { await ffmpeg.deleteFile(currentInputName); } catch (_) {}
     await ffmpeg.writeFile(currentInputName, bytes);
-    bytes = null;
     setProgress(76, '動画情報を解析中…', '長さ・FPS・映像ストリームを確認中。');
     const lines = [];
     const logger = ({message}) => lines.push(message);
@@ -1402,22 +1353,22 @@ restoreSettings();
 syncAmountSlider(true);
 setHistoryBaseline();
 updatePreviewPickState();
-els.dropzone.addEventListener('click', () => selectVideoFile());
-els.dropzone.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); selectVideoFile(); } });
-els.fileInput.addEventListener('change', e => { const file = e.target.files && e.target.files[0]; if (file) loadSelectedFile(file); e.target.value = ''; });
+els.dropzone.addEventListener('click', () => els.fileInput.click());
+els.dropzone.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); els.fileInput.click(); } });
+els.fileInput.addEventListener('change', e => { const file = e.target.files && e.target.files[0]; if (file) loadSelectedFile(file); });
 els.dropzone.addEventListener('dragover', e => { e.preventDefault(); els.dropzone.classList.add('drag'); });
 els.dropzone.addEventListener('dragleave', () => els.dropzone.classList.remove('drag'));
 els.dropzone.addEventListener('drop', e => { e.preventDefault(); els.dropzone.classList.remove('drag'); const file = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0]; if (file) loadSelectedFile(file); });
 els.previewShell.addEventListener('click', e => {
   if (currentFile) return;
   if (e.target.closest('video')) return;
-  selectVideoFile();
+  els.fileInput.click();
 });
 els.previewShell.addEventListener('keydown', e => {
   if (currentFile) return;
   if (e.key === 'Enter' || e.key === ' ') {
     e.preventDefault();
-    selectVideoFile();
+    els.fileInput.click();
   }
 });
 els.previewShell.addEventListener('dragover', e => {

@@ -892,55 +892,31 @@ function updatePreviewPickState() {
     : 'プレビュー。動画をドラッグ＆ドロップすると差し替え');
 }
 
-function readBlobWithFallback(blob) {
-  if (typeof blob.arrayBuffer === 'function') {
-    return blob.arrayBuffer().catch(primaryError => new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = () => resolve(reader.result);
-      reader.onerror = () => reject(reader.error || primaryError);
-      reader.onabort = () => reject(new Error('動画ファイルの読み込みが中断されたよ。'));
-      try { reader.readAsArrayBuffer(blob); }
-      catch (error) { reject(error || primaryError); }
-    }));
-  }
+function readSelectedFileImmediately(file) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
-    reader.onload = () => resolve(reader.result);
-    reader.onerror = () => reject(reader.error || new Error('動画ファイルを読み込めなかったよ。'));
+    reader.onload = () => {
+      if (reader.result instanceof ArrayBuffer) resolve(new Uint8Array(reader.result));
+      else reject(new Error('動画ファイルの読み込み結果を取得できなかったよ。'));
+    };
+    reader.onerror = () => {
+      const firstError = reader.error || new Error('FileReaderで動画ファイルを読み込めなかったよ。');
+      // FileReaderで失敗した場合だけ、Blob.arrayBuffer()でもう一度試す。
+      file.arrayBuffer().then(
+        buffer => resolve(new Uint8Array(buffer)),
+        secondError => reject(new Error(
+          `動画ファイルを読み込めなかったよ。\nFileReader: ${firstError.message || String(firstError)}\narrayBuffer: ${secondError && secondError.message ? secondError.message : String(secondError)}\nファイルがクラウド上のみの状態ではないか、別のアプリでロックされていないか確認して、PC内の別フォルダーにコピーしたファイルを選び直してみてね。`
+        ))
+      );
+    };
     reader.onabort = () => reject(new Error('動画ファイルの読み込みが中断されたよ。'));
-    try { reader.readAsArrayBuffer(blob); }
-    catch (error) { reject(error); }
-  });
-}
-
-async function readSelectedVideoBytes(file) {
-  if (!file || !Number.isSafeInteger(file.size) || file.size <= 0) {
-    throw new Error('動画ファイルのサイズを確認できなかったよ。もう一度ファイルを選んでね。');
-  }
-  let bytes;
-  try {
-    bytes = new Uint8Array(file.size);
-  } catch (error) {
-    throw new Error(`動画が大きすぎてメモリを確保できなかったよ（${humanSize(file.size)}）。短い動画か、容量の小さいファイルで試してね。`);
-  }
-  const chunkSize = 16 * 1024 * 1024;
-  for (let offset = 0; offset < file.size; offset += chunkSize) {
-    const end = Math.min(file.size, offset + chunkSize);
-    const part = file.slice(offset, end);
-    let buffer;
     try {
-      buffer = await readBlobWithFallback(part);
+      // ファイル選択イベントの直後に読み込みを開始する。FFmpegの通信待ちより先に参照を確保する。
+      reader.readAsArrayBuffer(file);
     } catch (error) {
-      const detail = error && error.message ? error.message : String(error);
-      throw new Error(`動画ファイルの読み込みに失敗したよ（${humanSize(offset)} / ${humanSize(file.size)}）。ファイルがOneDriveなどのオンライン専用状態でないか、別のアプリで書き込み中でないか確認して、PC内の通常フォルダにコピーしてから選び直してみてね。元のエラー：${detail}`);
+      reject(error);
     }
-    if (!buffer || buffer.byteLength !== part.size) {
-      throw new Error(`動画ファイルを最後まで読み込めなかったよ（${humanSize(offset)} / ${humanSize(file.size)}）。PC内の別のフォルダにコピーして、もう一度選んでね。`);
-    }
-    bytes.set(new Uint8Array(buffer), offset);
-    setProgress(2 + (end / file.size) * 2, '動画ファイルを先に読み込み中…', `${humanSize(end)} / ${humanSize(file.size)} を読み込み中`);
-  }
-  return bytes;
+  });
 }
 
 async function loadSelectedFile(file) {
@@ -950,6 +926,9 @@ async function loadSelectedFile(file) {
     alert('今の処理が終わってから、別のファイルを選んでね。');
     return;
   }
+  // Chrome / Edgeでは、選択から時間が経ってからFileを読むとNotReadableErrorになる場合があるため、
+  // ファイル選択イベント内で先に読み込みを開始しておく。
+  const fileBytesPromise = readSelectedFileImmediately(file);
   currentFile = file;
   updatePreviewPickState();
   currentExt = extFromName(file.name);
@@ -980,21 +959,21 @@ async function loadSelectedFile(file) {
   els.video.load();
   if (Number.isFinite(els.video.duration)) sourceDuration = els.video.duration;
   updateSummary();
-  await prepareWithFFmpeg(file, previousInputName);
+  await prepareWithFFmpeg(file, previousInputName, fileBytesPromise);
 }
-async function prepareWithFFmpeg(file, previousInputName = '') {
+async function prepareWithFFmpeg(file, previousInputName = '', fileBytesPromise = null) {
   busy = true;
   operation = 'prepare';
   els.cutButton.disabled = true;
   try {
-    // Read the selected file immediately, before the potentially slow FFmpeg engine download.
-    // This reduces the chance that a file reference becomes unreadable while the engine loads.
-    const bytes = await readSelectedVideoBytes(file);
+    setProgress(2, '動画ファイルを先に読み込み中…', `${humanSize(file.size)} を選択直後に読み込んでいるよ。`, true);
+    let bytes = await (fileBytesPromise || readSelectedFileImmediately(file));
     await ensureEngine();
-    setProgress(56, '動画を処理エンジンに読み込み中…', `${humanSize(file.size)} をブラウザ内に渡しているよ。`);
+    setProgress(56, 'ファイルをメモリに読み込み中…', `${humanSize(file.size)} をブラウザ内に読み込んでいるよ。`);
     if (previousInputName && previousInputName !== currentInputName) { try { await ffmpeg.deleteFile(previousInputName); } catch (_) {} }
     try { await ffmpeg.deleteFile(currentInputName); } catch (_) {}
     await ffmpeg.writeFile(currentInputName, bytes);
+    bytes = null;
     setProgress(76, '動画情報を解析中…', '長さ・FPS・映像ストリームを確認中。');
     const lines = [];
     const logger = ({message}) => lines.push(message);
